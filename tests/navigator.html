@@ -1,7 +1,11 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>Navigator tests running</title>
-<style>main { margin-top: 72px; height: 520px; overflow: auto; } article { min-height: 345px; }</style>
+<style>
+  main { margin-top: 72px; height: 520px; overflow: auto; }
+  article { min-height: 345px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+</style>
 <output id="report">Running navigator checks…</output>
 <main></main>
 <script>
@@ -186,23 +190,55 @@ const assert = (test, message) => { if (!test) throw new Error(message); };
   find("[aria-label='Previous prompt']").click();
   assert(active().includes("Third navigation prompt"), "Previous from the bottom goes to the closest prompt");
 
+  // The active ChatGPT timeline can coexist with a hidden copy during navigation.
+  const timeline = (role) => `
+    <div data-app-action-timeline-scroll role="${role}" style="height:280px;overflow:auto">
+      ${[0, 1, 2].map(i => `
+        <div data-turn-key="stable-${i}" style="min-height:420px">
+          <h4 data-conversation-role="user" class="sr-only">You said:</h4>
+          <div data-chatgpt-search-message-ids='["q-${i}"]' data-chatgpt-search-unit-key="fallback-turn-${i}:0:user">
+            <div data-content-search-unit-key="fallback-turn-${i}:0:user"><div data-user-message-bubble="true">Question ${i}</div></div>
+          </div>
+          <div data-content-search-unit-key="fallback-turn-${i}:1:assistant">
+            <h4 class="sr-only" data-conversation-role="assistant">ChatGPT said:</h4>
+            <h2>Route ${i}</h2>
+          </div>
+        </div>`).join("")}
+    </div>`;
+  main.innerHTML = timeline("presentation") + timeline("region");
+  main.firstElementChild.style.display = "none";
+  const live = main.lastElementChild;
+  await frame();
+  assert(status() === "3 prompts" && !find(".list").textContent.includes("You said"), "exclude role-bearing speaker labels and the inactive timeline");
+  find(".list button").click();
+  const firstPosition = live.scrollTop;
+  find("[aria-label='Next prompt']").click();
+  assert(active()?.includes("Question 1") && live.scrollTop > 250, "Next scrolls the active nested timeline");
+  find("[aria-label='Previous prompt']").click();
+  assert(active()?.includes("Question 0") && Math.abs(live.scrollTop - firstPosition) < 2, "Previous scrolls the same timeline back");
+  select("outline");
+  assert(status() === "3 headings" && find(".list").textContent.includes("Route 2"), "assistant unit retains its content when a nested speaker label carries the role");
+  select("conversation");
   const rowHeight = 270;
-  let count = 40;
-  let firstId = 4;
+  let count = 36;
+  let firstId = 8;
   let requested = false;
   let currentRange = "";
   const stage = document.createElement("div");
   stage.style.position = "relative";
   main.replaceChildren(stage);
   function virtualize() {
-    if (main.scrollTop <= 1 && !requested) {
+    if (main.scrollTop <= 1 && firstId > 0 && !requested) {
       requested = true;
       setTimeout(() => {
-        firstId = 0;
-        count = 44;
+        firstId -= 4;
+        count += 4;
+        stage.style.height = (count * rowHeight) + "px";
+        main.scrollTop += 4 * rowHeight;
         currentRange = "";
+        requested = false;
         virtualize();
-      }, 220);
+      }, 1150);
     }
     stage.style.height = (count * rowHeight) + "px";
     const start = Math.max(0, Math.floor(main.scrollTop / rowHeight) - 1);
@@ -222,6 +258,12 @@ const assert = (test, message) => { if (!test) throw new Error(message); };
       else if (id === 1) entry.innerHTML = '<p>Earliest response with train times</p><h2 id="historical-heading">Early timetable</h2><pre id="historical-code"><code>historic_code()</code></pre>';
       else if (id === 2 || id === 6) entry.textContent = "Repeated prompt with distinct turns";
       else entry.textContent = (role === "user" ? "Prompt " : "Reply ") + id;
+      // These search keys identify visible slots and are reused as the window moves.
+      const unit = document.createElement("div");
+      unit.dataset.contentSearchUnitKey = "fallback-turn-" + (i - start) + ":0:" + role;
+      if (id % 4 < 2) unit.dataset.chatgptSearchMessageIds = JSON.stringify(["message-" + id, "message-" + id]);
+      unit.append(...Array.from(entry.childNodes));
+      entry.append(unit);
       entries.push(entry);
     }
     stage.replaceChildren(...entries);
@@ -244,6 +286,10 @@ const assert = (test, message) => { if (!test) throw new Error(message); };
   find(".list li:first-child button").click();
   await waitUntil(() => !!active()?.includes("Earliest question"), "jump to an unmounted prompt");
   assert(main.scrollTop < 2 && main.querySelector('[data-turn-key="virtual-turn-0"]'), "old message remounts at the top");
+  find("[aria-label='Next prompt']").click();
+  await waitUntil(() => !!active()?.includes("Repeated prompt") && main.scrollTop > rowHeight, "Next advances to the following historical prompt");
+  find("[aria-label='Previous prompt']").click();
+  await waitUntil(() => !!active()?.includes("Earliest question") && main.scrollTop < 2, "Previous returns to the first historical prompt");
   filter("earliest response");
   assert(status() === "1 of 44 messages" && find(".list").textContent.includes("ChatGPT"), "search covers scanned replies");
   filter("");

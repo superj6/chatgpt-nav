@@ -8,9 +8,10 @@
   const replySelector = `${replyContentSelector}, [data-turn="assistant"], [data-conversation-role="assistant"], ` +
     '[data-message-role="assistant"], [data-content-search-unit-key$=":assistant"], [data-chatgpt-search-unit-key$=":assistant"]';
   const messageSelector = `${promptSelector}, ${replySelector}`;
-  const turnAttributes = ["data-message-id", "data-content-search-unit-key", "data-chatgpt-search-unit-key",
-    "data-turn-key", "data-turn-id", "data-virtual-list-item-key"];
+  const turnAttributes = ["data-message-id", "data-chatgpt-search-message-ids", "data-turn-key",
+    "data-turn-id", "data-virtual-list-item-key", "data-content-search-unit-key", "data-chatgpt-search-unit-key"];
   const turnWrapper = '[data-testid^="conversation-turn-"], [data-turn-key], [data-turn-id], [data-virtual-list-item-key]';
+  const timelineSelector = '[data-app-action-timeline-scroll][role="region"]';
   const visualSelector = 'img, canvas, iframe, svg[role="img"], svg[aria-label], [data-testid*="chart" i]';
   const screenReaderOnly = ".sr-only, .visually-hidden, .screen-reader-only";
   const views = {
@@ -115,6 +116,8 @@
 
   function navigationTargets() {
     const entries = Array.from(targets.values());
+    const first = mounted.values().next().value?.node;
+    if (first?.isConnected) chatScroller = scrollContainer(first);
     const container = chatScroller;
     if (!container || !entries.length) return {};
     if (lastJump?.container === container && Math.abs(container.scrollTop - lastJump.top) < 1) {
@@ -203,15 +206,20 @@
 
   function messageNodes(selector) {
     const nodes = new Map();
-    for (const match of document.querySelectorAll(selector)) {
+    const timeline = Array.from(document.querySelectorAll(timelineSelector))
+      .find((node) => visible(node) && node.getClientRects().length);
+    const scope = timeline ?? document;
+    for (const match of scope.querySelectorAll(selector)) {
+      if (!visible(match) || match.closest(screenReaderOnly) ||
+          match.closest('[data-app-action-timeline-scroll][role="presentation"]')) continue;
       const reply = match.matches(replySelector);
-      const content = reply ? replyContentSelector : contentSelector;
-      const node = match.querySelector(content) ?? match.closest(content) ?? match;
       const roleSelector = reply ? replySelector : promptSelector;
-      if (!visible(node)) continue;
-      if (node.matches(content) && node.querySelector(content)) continue;
-      if (!node.matches(content) && (node.querySelector(roleSelector) || node.parentElement?.closest(content))) continue;
-      nodes.set(node, reply ? "ChatGPT" : "You");
+      // A speaker heading can have the same role as the surrounding message.
+      // Only a genuine nested content node should displace its enclosing unit.
+      for (let parent = match.parentElement?.closest(roleSelector); parent; parent = parent.parentElement?.closest(roleSelector)) {
+        nodes.delete(parent);
+      }
+      nodes.set(match, reply ? "ChatGPT" : "You");
     }
     return nodes;
   }
@@ -219,10 +227,7 @@
   function readMessages(selector) {
     const nodes = messageNodes(selector);
     const first = nodes.keys().next().value;
-    if (first && (!chatScroller?.isConnected || !chatScroller.contains(first) ||
-        (chatScroller === document.scrollingElement && !historyIndex && !scan))) {
-      chatScroller = scrollContainer(first);
-    }
+    if (first) chatScroller = scrollContainer(first);
     const messages = new Map();
     if (!chatScroller) return messages;
 
@@ -239,9 +244,14 @@
       }
       let key = node;
       for (const attribute of turnAttributes) {
-        const value = node.closest(`[${attribute}]`)?.getAttribute(attribute);
-        if (!value) continue;
-        key = `${label}:${attribute}:${value}`;
+        let value = node.closest(`[${attribute}]`)?.getAttribute(attribute);
+        if (attribute === "data-chatgpt-search-message-ids" && value) {
+          value = value.split(/[\s,"\[\]]+/).find(Boolean);
+        }
+        // Window-relative slot numbers are reused for different messages as the chat scrolls.
+        if (!value || /^fallback-turn-\d+(?::|$)/.test(value)) continue;
+        const isMessageId = attribute === "data-message-id" || attribute === "data-chatgpt-search-message-ids";
+        key = `${label}:${isMessageId ? "message" : attribute}:${value}`;
         break;
       }
       if (key === node) {
@@ -548,9 +558,9 @@
     try {
       let height = container.scrollHeight;
       let quietSince = performance.now();
-      const deadline = quietSince + 10000;
-      // Older messages may be prepended asynchronously when the top is reached.
-      while (canScan() && performance.now() - quietSince < 850 && performance.now() < deadline) {
+      // Each prepend can take over a second and move the viewport away from the top.
+      // Give every new page time to arrive, including in chats that need many pages.
+      while (canScan() && performance.now() - quietSince < 2000) {
         container.scrollTo({ top: 0, behavior: "instant" });
         await delay(100);
         if (container.scrollHeight !== height || container.scrollTop > 1) {

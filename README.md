@@ -16,6 +16,8 @@ Firefox removes temporary add-ons when it restarts. Repeat steps 1–3 to load i
 2. Upload the [packaged ZIP](chatgpt-conversation-navigator.zip) and download the signed `.xpi` when Mozilla finishes signing it. [Mozilla’s signing instructions](https://extensionworkshop.com/documentation/publish/submitting-an-add-on/#self-distribution)
 3. Open `about:addons` in Firefox, click the gear icon, and use **Install Add-on From File** to select the signed `.xpi`. [Mozilla’s installation instructions](https://extensionworkshop.com/documentation/publish/install-self-distributed/#install-add-on-from-file-on-a-computer)
 
+To update an existing installation, open your add-on in **My Add-ons** and upload the ZIP as a new version. Once it is signed, choose **View All** under the latest version, open the new version, and right-click its file link to **Save Link As**. Install that signed file through `about:addons` and reload the ChatGPT tab. [Mozilla Developer Hub](https://addons.mozilla.org/en-US/developers/addons)
+
 ## Use
 
 - Click **Navigate chat** near the upper right or press **Alt+Shift+J** to open the navigator.
