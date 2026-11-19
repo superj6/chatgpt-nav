@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT Conversation Navigator",
+  "version": "1.0.0",
+  "description": "Find your prompts and jump around the current ChatGPT conversation.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "conversation-navigator@local.chatgpt-nav",
+      "data_collection_permissions": { "required": ["none"] }
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["navigator.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["navigator.css"],
+      "matches": ["https://chatgpt.com/*"]
+    }
+  ]
+}
