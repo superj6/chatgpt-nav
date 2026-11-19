@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Conversation Navigator",
-  "version": "1.0.0",
-  "description": "Find your prompts and jump around the current ChatGPT conversation.",
+  "version": "1.0.1",
+  "description": "Search ChatGPT conversations and jump to prompts, replies, code blocks, tables, and charts.",
   "browser_specific_settings": {
     "gecko": {
       "id": "conversation-navigator@local.chatgpt-nav",

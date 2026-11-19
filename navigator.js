@@ -2,10 +2,15 @@
   "use strict";
 
   const contentSelector = '[data-message-author-role="user"], [data-user-message-bubble="true"]';
-  const promptSelector = `${contentSelector}, [data-turn="user"], [data-content-search-unit-key$=":user"]`;
   const replyContentSelector = '[data-message-author-role="assistant"]';
-  const replySelector = `${replyContentSelector}, [data-turn="assistant"], [data-content-search-unit-key$=":assistant"]`;
+  const promptSelector = `${contentSelector}, [data-turn="user"], [data-conversation-role="user"], ` +
+    '[data-message-role="user"], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"]';
+  const replySelector = `${replyContentSelector}, [data-turn="assistant"], [data-conversation-role="assistant"], ` +
+    '[data-message-role="assistant"], [data-content-search-unit-key$=":assistant"], [data-chatgpt-search-unit-key$=":assistant"]';
   const messageSelector = `${promptSelector}, ${replySelector}`;
+  const turnAttributes = ["data-message-id", "data-content-search-unit-key", "data-chatgpt-search-unit-key",
+    "data-turn-key", "data-turn-id", "data-virtual-list-item-key"];
+  const turnWrapper = '[data-testid^="conversation-turn-"], [data-turn-key], [data-turn-id], [data-virtual-list-item-key]';
   const visualSelector = 'img, canvas, iframe, svg[role="img"], svg[aria-label], [data-testid*="chart" i]';
   const views = {
     conversation: { name: "Conversation", placeholder: "Search the conversation" },
@@ -37,6 +42,7 @@
   const previous = element("button", "Previous", { type: "button", "aria-label": "Previous prompt" });
   const next = element("button", "Next", { type: "button", "aria-label": "Next prompt" });
   const latest = element("button", "Latest", { type: "button", "aria-label": "Latest prompt" });
+  const scanButton = element("button", "Scan full chat", { type: "button" });
   const filters = element("div", "", { class: "filters" });
   const view = element("select", "", { "aria-label": "Show" });
   for (const [value, { name }] of Object.entries(views)) view.append(element("option", name, { value }));
@@ -47,7 +53,7 @@
   const status = element("p", "", { class: "status", role: "status" });
   const list = element("ul", "", { class: "list", "aria-label": "Jump targets", role: "list" });
 
-  controls.append(previous, next, latest);
+  controls.append(previous, next, latest, scanButton);
   filters.append(view, search);
   panel.append(controls, filters, status, list);
   shadow.append(stylesheet, launcher, panel);
@@ -56,11 +62,18 @@
   document.body.append(host);
 
   let prompts = [];
+  let mounted = new Map();
+  let chatScroller;
+  let historyIndex;
+  let scan;
+  let jumpRequest = 0;
+  let notice = "";
   let pathname = location.pathname;
   let lastJump;
   let currentRow;
   let selectedResult;
   let rows = new Map();
+  let targets = new Map();
   let displayed = [];
   let refreshFrame = 0;
   let scrollFrame = 0;
@@ -78,21 +91,33 @@
     return Math.max(84, container.getBoundingClientRect().top + 16);
   }
 
+  function viewportTop(container) {
+    return container === document.scrollingElement ? 0 : container.getBoundingClientRect().top;
+  }
+
+  function maxScroll(container) {
+    return Math.max(0, container.scrollHeight - container.clientHeight);
+  }
+
   function indexAtViewport() {
     if (!prompts.length) return -1;
-    if (lastJump && Math.abs(lastJump.container.scrollTop - lastJump.top) < 1) {
-      const index = prompts.findIndex(({ node }) => node === lastJump.node);
+    if (lastJump && lastJump.container === chatScroller && Math.abs(lastJump.container.scrollTop - lastJump.top) < 1) {
+      const index = prompts.findIndex(({ key }) => key === lastJump.key);
       if (index !== -1) return index;
     }
     lastJump = undefined;
 
-    const container = scrollContainer(prompts[0].node);
-    const remaining = container.scrollHeight - container.clientHeight - container.scrollTop;
-    if (container.scrollTop > 0 && remaining <= 1) return prompts.length - 1;
+    const container = chatScroller;
+    if (!container) return 0;
+    if (container.scrollTop > 0 && maxScroll(container) - container.scrollTop <= 1) return prompts.length - 1;
 
     const anchor = scrollAnchor(container) + 8;
+    const origin = container.scrollTop - viewportTop(container);
     for (let index = prompts.length - 1; index > 0; index--) {
-      if (prompts[index].node.getBoundingClientRect().top <= anchor) return index;
+      const { key, top } = prompts[index];
+      const mountedNode = mounted.get(key)?.node;
+      const position = mountedNode ? mountedNode.getBoundingClientRect().top : top - origin;
+      if (position <= anchor) return index;
     }
     return 0;
   }
@@ -100,30 +125,30 @@
   function updateNavigation() {
     const browsingPrompts = isPromptList();
     const currentIndex = browsingPrompts ? indexAtViewport() : -1;
-    previous.disabled = browsingPrompts ? currentIndex <= 0 : !rows.size;
-    next.disabled = browsingPrompts ? currentIndex < 0 || currentIndex === prompts.length - 1 : !rows.size;
-    latest.disabled = browsingPrompts ? !prompts.length : !rows.size;
+    previous.disabled = !!scan || (browsingPrompts ? currentIndex <= 0 : !rows.size);
+    next.disabled = !!scan || (browsingPrompts ? currentIndex < 0 || currentIndex === prompts.length - 1 : !rows.size);
+    latest.disabled = !!scan || (browsingPrompts ? !prompts.length : !rows.size);
     previous.setAttribute("aria-label", browsingPrompts ? "Previous prompt" : "Previous item");
     next.setAttribute("aria-label", browsingPrompts ? "Next prompt" : "Next item");
     latest.setAttribute("aria-label", browsingPrompts ? "Latest prompt" : "Last item");
     const lastLabel = browsingPrompts ? "Latest" : "Last";
     if (latest.textContent !== lastLabel) latest.textContent = lastLabel;
 
-    const activeRow = rows.get(browsingPrompts ? prompts[currentIndex]?.node : selectedResult);
+    const activeRow = rows.get(browsingPrompts ? prompts[currentIndex]?.key : selectedResult);
     if (activeRow === currentRow) return;
     currentRow?.removeAttribute("aria-current");
     activeRow?.setAttribute("aria-current", "true");
     currentRow = activeRow;
   }
 
-  function jumpTo(node) {
-    if (!node?.isConnected) return;
+  function jumpTo(node, key) {
     const container = scrollContainer(node.closest(messageSelector) ?? node);
     const top = node.getBoundingClientRect().top - scrollAnchor(container);
     container.scrollBy({ top, behavior: "instant" });
-    lastJump = { node, container, top: container.scrollTop };
-    selectedResult = node;
+    lastJump = { key, container, top: container.scrollTop };
+    selectedResult = key;
     updateNavigation();
+    rows.get(key)?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
   }
 
   function normalize(text) {
@@ -143,10 +168,63 @@
     for (const match of document.querySelectorAll(selector)) {
       const reply = match.matches(replySelector);
       const content = reply ? replyContentSelector : contentSelector;
-      const node = match.matches(content) ? match : match.querySelector(content) ?? match;
-      if (visible(node)) nodes.set(node, reply ? "ChatGPT" : "You");
+      const node = match.querySelector(content) ?? match.closest(content) ?? match;
+      const roleSelector = reply ? replySelector : promptSelector;
+      if (!visible(node)) continue;
+      if (node.matches(content) && node.querySelector(content)) continue;
+      if (!node.matches(content) && (node.querySelector(roleSelector) || node.parentElement?.closest(content))) continue;
+      nodes.set(node, reply ? "ChatGPT" : "You");
     }
     return nodes;
+  }
+
+  function readMessages(selector) {
+    const nodes = messageNodes(selector);
+    const first = nodes.keys().next().value;
+    if (first && (!chatScroller?.isConnected || !chatScroller.contains(first) ||
+        (chatScroller === document.scrollingElement && !historyIndex && !scan))) {
+      chatScroller = scrollContainer(first);
+    }
+    const messages = new Map();
+    if (!chatScroller) return messages;
+
+    const measure = historyIndex || scan?.gathering;
+    const origin = measure ? chatScroller.scrollTop - viewportTop(chatScroller) : 0;
+    for (const [node, label] of nodes) {
+      const text = normalize(node.innerText) || normalize(node.textContent);
+      if (!text && !node.querySelector('img, video, audio, [data-testid*="attachment" i]')) continue;
+      let top;
+      if (measure) {
+        const rect = node.getBoundingClientRect();
+        const wrapper = node.closest(turnWrapper);
+        top = (rect.height || !wrapper ? rect.top : wrapper.getBoundingClientRect().top) + origin;
+      }
+      let key = node;
+      for (const attribute of turnAttributes) {
+        const value = node.closest(`[${attribute}]`)?.getAttribute(attribute);
+        if (!value) continue;
+        key = `${label}:${attribute}:${value}`;
+        break;
+      }
+      if (key === node) {
+        const turn = node.closest('[data-testid^="conversation-turn-"]')?.dataset.testid;
+        if (turn) key = `${label}:${turn}`;
+        else if (measure) key = `${label}:${Math.round(top)}`;
+      }
+      messages.set(key, { key, node, label, text: text || "Attachment", top });
+    }
+    return messages;
+  }
+
+  function indexMessages(index) {
+    for (const { key, label, text, top } of mounted.values()) {
+      index.set(key, { key, label, text, top });
+    }
+  }
+
+  function conversationEntries() {
+    if (!historyIndex) return Array.from(mounted.values());
+    return Array.from(historyIndex.values()).sort((a, b) => a.top - b.top);
   }
 
   function describeItem(node, mode) {
@@ -168,11 +246,9 @@
   }
 
   function collectItems(mode) {
-    const messages = messageNodes(messageSelector);
-    if (mode === "conversation") {
-      return Array.from(messages, ([node, label]) => ({ node, label, text: normalize(node.innerText) }));
-    }
+    if (mode === "conversation") return historyIndex ? conversationEntries() : Array.from(readMessages(messageSelector).values());
 
+    const messages = messageNodes(messageSelector);
     const { selector } = views[mode];
     const items = new Map();
     for (const message of messages.keys()) {
@@ -180,25 +256,60 @@
         const parentItem = node.parentElement.closest(selector);
         if (!visible(node) || (parentItem && message.contains(parentItem))) continue;
         if (node.localName === "img" && node.naturalWidth > 0 && node.naturalWidth < 40 && node.naturalHeight < 40) continue;
-        items.set(node, { node, ...describeItem(node, mode) });
+        items.set(node, { key: node, node, ...describeItem(node, mode) });
       }
     }
     return Array.from(items.values());
   }
 
-  function chooseResult(node) {
-    if (!node) return;
-    jumpTo(node);
-    rows.get(node)?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
+  function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function findIndexedMessage(entry, container, request) {
+    const step = Math.max(1, container.clientHeight * 0.7);
+    const top = entry.top - scrollAnchor(container) + viewportTop(container);
+    notice = "Finding message…";
+    renderList();
+    for (const offset of [0, -step, step]) {
+      container.scrollTo({ top: top + offset, behavior: "instant" });
+      for (let attempt = 0; attempt < 4; attempt++) {
+        await delay(80);
+        if (request !== jumpRequest || pathname !== location.pathname || !container.isConnected) return;
+        const node = readMessages(messageSelector).get(entry.key)?.node;
+        if (!node) continue;
+        notice = "";
+        refreshPrompts();
+        jumpTo(node, entry.key);
+        return;
+      }
+    }
+    notice = "Message unavailable. Try scanning again.";
+    renderList();
+  }
+
+  function chooseResult(entry) {
+    if (!entry || scan) return;
+    const request = ++jumpRequest;
+    const node = mounted.get(entry.key)?.node ?? entry.node;
+    if (node?.isConnected) {
+      if (notice) {
+        notice = "";
+        renderList();
+      }
+      jumpTo(node, entry.key);
+    } else if (chatScroller?.isConnected && Number.isFinite(entry.top)) {
+      void findIndexedMessage(entry, chatScroller, request);
+    }
   }
 
   function stepResult(direction) {
-    const targets = Array.from(rows.keys());
-    if (!targets.length) return;
-    const index = targets.indexOf(selectedResult);
-    const position = index === -1 ? (direction === 1 ? 0 : targets.length - 1) :
-      (index + direction + targets.length) % targets.length;
-    chooseResult(targets[position]);
+    const keys = Array.from(rows.keys());
+    if (!keys.length) return;
+    const index = keys.indexOf(selectedResult);
+    const position = index === -1 ? (direction === 1 ? 0 : keys.length - 1) :
+      (index + direction + keys.length) % keys.length;
+    chooseResult(targets.get(keys[position]));
   }
 
   function renderList() {
@@ -207,44 +318,46 @@
     const entries = browsingPrompts ? prompts : collectItems(view.value);
     const noun = browsingPrompts ? "prompt" : views[view.value].noun ?? "message";
     const results = [];
-    entries.forEach(({ node, label, text }, index) => {
+    entries.forEach((entry, index) => {
+      const { key, label, text } = entry;
       const labelMatches = label?.toLowerCase().includes(query);
       const offset = text.toLowerCase().indexOf(query);
       if (query && offset < 0 && !labelMatches) return;
       const start = Math.max(0, offset - 48);
       const end = start + 150;
       const excerpt = `${start ? "…" : ""}${text.slice(start, end)}${text.length > end ? "…" : ""}`;
-      results.push({ node, label: browsingPrompts ? String(index + 1) : label, excerpt, browsingPrompts });
+      results.push({ key, entry, label: browsingPrompts ? String(index + 1) : label, excerpt, browsingPrompts });
     });
 
     const total = entries.length;
-    const summary = query ? `${results.length} of ${total} ${noun}${total === 1 ? "" : "s"}` :
-      `${total} ${noun}${total === 1 ? "" : "s"}`;
+    const summary = notice || (query ? `${results.length} of ${total} ${noun}${total === 1 ? "" : "s"}` :
+      `${total} ${noun}${total === 1 ? "" : "s"}`);
     if (status.textContent !== summary) status.textContent = summary;
-    if (results.length === displayed.length && results.every(({ node, label, excerpt, browsingPrompts }, index) => (
-      node === displayed[index].node && label === displayed[index].label && excerpt === displayed[index].excerpt &&
+    targets = new Map(results.map(({ key, entry }) => [key, entry]));
+    if (results.length === displayed.length && results.every(({ key, label, excerpt, browsingPrompts }, index) => (
+      key === displayed[index].key && label === displayed[index].label && excerpt === displayed[index].excerpt &&
       browsingPrompts === displayed[index].browsingPrompts
     ))) {
       updateNavigation();
       return;
     }
-    displayed = results;
+    displayed = results.map(({ key, label, excerpt, browsingPrompts }) => ({ key, label, excerpt, browsingPrompts }));
     list.classList.toggle("details", !browsingPrompts);
     const focusedRow = shadow.activeElement;
     const items = document.createDocumentFragment();
     let nextFocus;
     const visibleRows = new Map();
 
-    for (const { node, label, excerpt } of results) {
+    for (const { key, label, excerpt } of results) {
       const button = element("button", "", { type: "button" });
       button.append(element("span", label, { class: browsingPrompts ? "number" : "label" }));
       if (excerpt) button.append(element("span", excerpt));
-      button.addEventListener("click", () => chooseResult(node));
+      button.addEventListener("click", () => chooseResult(targets.get(key)));
       const item = element("li");
       item.append(button);
       items.append(item);
-      visibleRows.set(node, button);
-      if (focusedRow && focusedRow === rows.get(node)) nextFocus = button;
+      visibleRows.set(key, button);
+      if (focusedRow && focusedRow === rows.get(key)) nextFocus = button;
     }
     rows = visibleRows;
     list.replaceChildren(items);
@@ -253,6 +366,11 @@
   }
 
   function setOpen(open) {
+    if (!open) {
+      if (scan) scan.stopped = true;
+      jumpRequest++;
+      notice = "";
+    }
     panel.hidden = !open;
     launcher.setAttribute("aria-expanded", String(open));
     if (open) {
@@ -261,27 +379,110 @@
     }
   }
 
+  function setScanBusy(busy) {
+    scanButton.textContent = busy ? "Stop scan" : "Scan full chat";
+    search.disabled = busy;
+    view.disabled = busy;
+    list.inert = busy;
+    updateNavigation();
+  }
+
+  async function scanConversation() {
+    if (scan) {
+      scan.stopped = true;
+      return;
+    }
+    const container = chatScroller;
+    if (!container?.isConnected) return;
+    const path = location.pathname;
+    const startTop = container.scrollTop;
+    const startBottom = maxScroll(container);
+    const state = { index: new Map(), restore: true, gathering: false, stopped: false };
+    const canScan = () => scan === state && !state.stopped && path === location.pathname && container.isConnected;
+    jumpRequest++;
+    notice = "";
+    scan = state;
+    setScanBusy(true);
+    status.textContent = "Loading older messages…";
+
+    try {
+      let height = container.scrollHeight;
+      let quietSince = performance.now();
+      const deadline = quietSince + 10000;
+      // Older messages may be prepended asynchronously when the top is reached.
+      while (canScan() && performance.now() - quietSince < 850 && performance.now() < deadline) {
+        container.scrollTo({ top: 0, behavior: "instant" });
+        await delay(100);
+        if (container.scrollHeight !== height || container.scrollTop > 1) {
+          height = container.scrollHeight;
+          quietSince = performance.now();
+        }
+      }
+      if (!canScan()) return;
+      state.gathering = true;
+      refreshPrompts();
+
+      // Overlap viewports so short prompts between long replies are picked up.
+      while (canScan()) {
+        const top = container.scrollTop;
+        const end = maxScroll(container);
+        if (end - top <= 1) {
+          await delay(180);
+          if (!canScan() || maxScroll(container) <= end + 1) break;
+        } else {
+          const step = Math.max(1, Math.floor(container.clientHeight * 0.75));
+          container.scrollTo({ top: top + step, behavior: "instant" });
+          await delay(70);
+        }
+        if (!canScan()) break;
+        refreshPrompts();
+        if (container.scrollTop <= top && maxScroll(container) <= end) break;
+      }
+      if (canScan()) refreshPrompts();
+    } finally {
+      if (scan === state) {
+        scan = undefined;
+        if (path === location.pathname && container.isConnected) {
+          if (state.index.size && (!state.stopped || !historyIndex)) historyIndex = state.index;
+          if (state.restore) container.scrollTo({ top: startTop + maxScroll(container) - startBottom, behavior: "instant" });
+        }
+        setScanBusy(false);
+        refreshPrompts();
+      }
+    }
+  }
+
   function refreshPrompts() {
     refreshFrame = 0;
-    const routeChanged = pathname !== location.pathname;
-    if (routeChanged) {
+    if (pathname !== location.pathname) {
       pathname = location.pathname;
+      scan = undefined;
+      historyIndex = undefined;
+      chatScroller = undefined;
+      mounted.clear();
       lastJump = undefined;
       selectedResult = undefined;
+      jumpRequest++;
+      notice = "";
       search.value = "";
+      setScanBusy(false);
     }
 
-    const updated = Array.from(messageNodes(promptSelector).keys(), (node) => ({
-      node,
-      text: normalize(node.innerText) || "Prompt with no text",
-    }));
-    const unchanged = !routeChanged && updated.length === prompts.length && updated.every(({ node, text }, index) => (
-      node === prompts[index].node && text === prompts[index].text
-    ));
-    if (unchanged && (panel.hidden || isPromptList())) return;
+    mounted = readMessages(scan?.gathering || historyIndex ? messageSelector : promptSelector);
+    if (!mounted.size && !scan && !historyIndex) mounted = readMessages(replySelector);
+    if (scan) {
+      if (scan.gathering) {
+        indexMessages(scan.index);
+        const count = Array.from(scan.index.values()).filter(({ label }) => label === "You").length;
+        const progress = `Scanning… ${count} ${count === 1 ? "prompt" : "prompts"} found`;
+        if (status.textContent !== progress) status.textContent = progress;
+      }
+      return;
+    }
 
-    prompts = updated;
-    host.hidden = !prompts.length;
+    if (historyIndex) indexMessages(historyIndex);
+    prompts = conversationEntries().filter(({ label }) => label === "You");
+    host.hidden = !prompts.length && !mounted.size;
     if (host.hidden) setOpen(false);
     if (!panel.hidden) renderList();
   }
@@ -291,10 +492,15 @@
   }
 
   function touchesMessage(record) {
-    const selector = panel.hidden || isPromptList() ? promptSelector : messageSelector;
+    const selector = scan || historyIndex || !prompts.length || (!panel.hidden && !isPromptList()) ?
+      messageSelector : promptSelector;
     const target = record.target.nodeType === Node.ELEMENT_NODE ? record.target : record.target.parentElement;
     if (host.contains(target)) return false;
-    if (record.type === "attributes" || target?.closest(selector)) return true;
+    if (target?.closest(selector)) return true;
+    if (record.type === "attributes") {
+      if (["hidden", "aria-hidden", "data-testid"].includes(record.attributeName)) return target?.querySelector(selector);
+      return true;
+    }
     const nodes = [...record.addedNodes, ...record.removedNodes];
     return nodes.some((node) => node.nodeType === Node.ELEMENT_NODE && (
       node.matches(selector) || node.querySelector(selector)
@@ -302,23 +508,28 @@
   }
 
   launcher.addEventListener("click", () => setOpen(panel.hidden));
+  scanButton.addEventListener("click", () => void scanConversation());
   previous.addEventListener("click", () => {
-    if (isPromptList()) jumpTo(prompts[indexAtViewport() - 1]?.node);
+    if (isPromptList()) chooseResult(prompts[indexAtViewport() - 1]);
     else stepResult(-1);
   });
   next.addEventListener("click", () => {
-    if (isPromptList()) jumpTo(prompts[indexAtViewport() + 1]?.node);
+    if (isPromptList()) chooseResult(prompts[indexAtViewport() + 1]);
     else stepResult(1);
   });
   latest.addEventListener("click", () => {
-    if (isPromptList()) jumpTo(prompts.at(-1)?.node);
-    else chooseResult(Array.from(rows.keys()).at(-1));
+    if (isPromptList()) chooseResult(prompts.at(-1));
+    else chooseResult(Array.from(targets.values()).at(-1));
   });
   search.addEventListener("input", () => {
+    jumpRequest++;
+    notice = "";
     selectedResult = undefined;
     renderList();
   });
   view.addEventListener("change", () => {
+    jumpRequest++;
+    notice = "";
     search.value = "";
     const { placeholder } = views[view.value];
     search.placeholder = placeholder;
@@ -346,12 +557,19 @@
     if (panel.hidden) launcher.focus({ preventScroll: true });
   });
   document.addEventListener("scroll", (event) => {
-    if (panel.hidden || event.composedPath().includes(host) || scrollFrame) return;
+    if (scan || panel.hidden || event.composedPath().includes(host) || scrollFrame) return;
     scrollFrame = requestAnimationFrame(() => {
       scrollFrame = 0;
       if (!panel.hidden) updateNavigation();
     });
   }, { capture: true, passive: true });
+  for (const type of ["wheel", "touchstart"]) {
+    document.addEventListener(type, (event) => {
+      if (!scan || event.composedPath().includes(host)) return;
+      scan.stopped = true;
+      scan.restore = false;
+    }, { capture: true, passive: true });
+  }
   window.addEventListener("popstate", scheduleRefresh);
 
   const observer = new MutationObserver((records) => {
@@ -362,7 +580,8 @@
     childList: true,
     characterData: true,
     attributes: true,
-    attributeFilter: ["data-message-author-role", "data-user-message-bubble", "data-turn", "data-content-search-unit-key"],
+    attributeFilter: [...turnAttributes, "data-message-author-role", "data-user-message-bubble", "data-turn",
+      "data-conversation-role", "data-message-role", "data-testid", "hidden", "aria-hidden"],
   });
   refreshPrompts();
 })();
