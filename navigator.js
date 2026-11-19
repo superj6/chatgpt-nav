@@ -12,12 +12,17 @@
     "data-turn-key", "data-turn-id", "data-virtual-list-item-key"];
   const turnWrapper = '[data-testid^="conversation-turn-"], [data-turn-key], [data-turn-id], [data-virtual-list-item-key]';
   const visualSelector = 'img, canvas, iframe, svg[role="img"], svg[aria-label], [data-testid*="chart" i]';
+  const screenReaderOnly = ".sr-only, .visually-hidden, .screen-reader-only";
   const views = {
     conversation: { name: "Conversation", placeholder: "Search the conversation" },
+    outline: { name: "Outline", selector: 'h1, h2, h3, h4, h5, h6, [role="heading"]', noun: "heading", placeholder: "Search headings" },
     code: { name: "Code blocks", selector: "pre", noun: "code block", placeholder: "Search code blocks" },
     tables: { name: "Tables", selector: 'table, [role="table"]', noun: "table", placeholder: "Search tables" },
     visuals: { name: "Charts & images", selector: visualSelector, noun: "visual", placeholder: "Search charts and images" },
+    lists: { name: "Lists", selector: "ul, ol", noun: "list", placeholder: "Search lists" },
+    quotes: { name: "Quotes", selector: "blockquote", noun: "quote", placeholder: "Search quotes" },
   };
+  const detailModes = Object.keys(views).filter((mode) => views[mode].selector);
   const host = document.createElement("div");
   host.id = "chatgpt-conversation-navigator";
   if (document.getElementById(host.id)) return;
@@ -51,11 +56,17 @@
     "aria-label": views.conversation.placeholder, autocomplete: "off",
   });
   const status = element("p", "", { class: "status", role: "status" });
+  const detailControls = element("div", "", { class: "detail-controls" });
+  const foldAll = element("button", "Collapse all", { type: "button" });
+  const topLevelOnly = element("input", "", { type: "checkbox" });
+  const depth = element("label", "");
+  depth.append(topLevelOnly, document.createTextNode("Top-level only"));
+  detailControls.append(foldAll, depth);
   const list = element("ul", "", { class: "list", "aria-label": "Jump targets", role: "list" });
 
   controls.append(previous, next, latest, scanButton);
   filters.append(view, search);
-  panel.append(controls, filters, status, list);
+  panel.append(controls, filters, detailControls, status, list);
   shadow.append(stylesheet, launcher, panel);
   host.hidden = true;
   panel.hidden = true;
@@ -63,6 +74,8 @@
 
   let prompts = [];
   let mounted = new Map();
+  let detailSnapshots = new WeakMap();
+  const collapsedGroups = new Map(detailModes.map((mode) => [mode, new Set()]));
   let chatScroller;
   let historyIndex;
   let scan;
@@ -77,6 +90,7 @@
   let displayed = [];
   let refreshFrame = 0;
   let scrollFrame = 0;
+  let groupControlsFrame = 0;
 
   function scrollContainer(node) {
     for (let parent = node.parentElement; parent && parent !== document.body; parent = parent.parentElement) {
@@ -99,42 +113,43 @@
     return Math.max(0, container.scrollHeight - container.clientHeight);
   }
 
-  function indexAtViewport() {
-    if (!prompts.length) return -1;
-    if (lastJump && lastJump.container === chatScroller && Math.abs(lastJump.container.scrollTop - lastJump.top) < 1) {
-      const index = prompts.findIndex(({ key }) => key === lastJump.key);
-      if (index !== -1) return index;
+  function navigationTargets() {
+    const entries = Array.from(targets.values());
+    const container = chatScroller;
+    if (!container || !entries.length) return {};
+    if (lastJump?.container === container && Math.abs(container.scrollTop - lastJump.top) < 1) {
+      const index = entries.findIndex(({ key }) => key === lastJump.key);
+      if (index !== -1) return { current: entries[index], before: entries[index - 1], after: entries[index + 1] };
     }
     lastJump = undefined;
 
-    const container = chatScroller;
-    if (!container) return 0;
-    if (container.scrollTop > 0 && maxScroll(container) - container.scrollTop <= 1) return prompts.length - 1;
-
-    const anchor = scrollAnchor(container) + 8;
+    const anchor = scrollAnchor(container);
     const origin = container.scrollTop - viewportTop(container);
-    for (let index = prompts.length - 1; index > 0; index--) {
-      const { key, top } = prompts[index];
-      const mountedNode = mounted.get(key)?.node;
-      const position = mountedNode ? mountedNode.getBoundingClientRect().top : top - origin;
-      if (position <= anchor) return index;
+    let before, after, current;
+    for (const entry of entries) {
+      const node = entry.node ?? mounted.get(entry.key)?.node;
+      const position = node?.isConnected ? node.getBoundingClientRect().top : entry.top - origin;
+      if (position < anchor - 8) before = entry;
+      else if (position <= anchor + 8) current ??= entry;
+      else if (position > anchor + 8) after ??= entry;
     }
-    return 0;
+    const active = current ?? (isPromptList() ? before ?? entries[0] : undefined);
+    return { before: container.scrollTop > 1 ? before : undefined, after, current: active };
   }
 
   function updateNavigation() {
     const browsingPrompts = isPromptList();
-    const currentIndex = browsingPrompts ? indexAtViewport() : -1;
-    previous.disabled = !!scan || (browsingPrompts ? currentIndex <= 0 : !rows.size);
-    next.disabled = !!scan || (browsingPrompts ? currentIndex < 0 || currentIndex === prompts.length - 1 : !rows.size);
-    latest.disabled = !!scan || (browsingPrompts ? !prompts.length : !rows.size);
+    const { before, after, current } = navigationTargets();
+    previous.disabled = !!scan || !before;
+    next.disabled = !!scan || !after;
+    latest.disabled = !!scan || !rows.size;
     previous.setAttribute("aria-label", browsingPrompts ? "Previous prompt" : "Previous item");
     next.setAttribute("aria-label", browsingPrompts ? "Next prompt" : "Next item");
     latest.setAttribute("aria-label", browsingPrompts ? "Latest prompt" : "Last item");
     const lastLabel = browsingPrompts ? "Latest" : "Last";
     if (latest.textContent !== lastLabel) latest.textContent = lastLabel;
 
-    const activeRow = rows.get(browsingPrompts ? prompts[currentIndex]?.key : selectedResult);
+    const activeRow = rows.get(current?.key);
     if (activeRow === currentRow) return;
     currentRow?.removeAttribute("aria-current");
     activeRow?.setAttribute("aria-current", "true");
@@ -148,11 +163,34 @@
     lastJump = { key, container, top: container.scrollTop };
     selectedResult = key;
     updateNavigation();
-    rows.get(key)?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
+    const row = rows.get(key);
+    const group = row?.closest("details");
+    if (group && !group.open) group.open = true;
+    row?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
   }
 
   function normalize(text) {
     return text?.replace(/\s+/g, " ").trim() ?? "";
+  }
+
+  function messageText(node, label) {
+    const speaker = `${label} said`;
+    const headings = Array.from(node.querySelectorAll(screenReaderOnly))
+      .filter((heading) => {
+        const text = normalize(heading.textContent);
+        return text === speaker || text === `${speaker}:`;
+      });
+    if (!headings.length) return normalize(node.innerText) || normalize(node.textContent);
+
+    function read(part) {
+      if (headings.includes(part)) return "";
+      if (headings.some((heading) => part.contains(heading))) {
+        return Array.from(part.childNodes, read).join(" ");
+      }
+      return part.innerText || part.textContent;
+    }
+
+    return normalize(read(node));
   }
 
   function isPromptList() {
@@ -191,8 +229,8 @@
     const measure = historyIndex || scan?.gathering;
     const origin = measure ? chatScroller.scrollTop - viewportTop(chatScroller) : 0;
     for (const [node, label] of nodes) {
-      const text = normalize(node.innerText) || normalize(node.textContent);
-      if (!text && !node.querySelector('img, video, audio, [data-testid*="attachment" i]')) continue;
+      const text = messageText(node, label);
+      if (!text && !node.querySelector(`video, audio, [data-testid*="attachment" i], ${visualSelector}`)) continue;
       let top;
       if (measure) {
         const rect = node.getBoundingClientRect();
@@ -217,8 +255,18 @@
   }
 
   function indexMessages(index) {
-    for (const { key, label, text, top } of mounted.values()) {
-      index.set(key, { key, label, text, top });
+    for (const message of mounted.values()) {
+      const { key, node, label, text, top } = message;
+      let snapshot = detailSnapshots.get(node);
+      if (!snapshot || snapshot.key !== key || snapshot.text !== text || snapshot.top !== top) {
+        const details = {};
+        for (const mode of detailModes) {
+          details[mode] = readItems(message, mode).map(({ node, ...item }) => item);
+        }
+        snapshot = { key, label, text, top, details };
+        detailSnapshots.set(node, snapshot);
+      }
+      index.set(key, snapshot);
     }
   }
 
@@ -228,6 +276,11 @@
   }
 
   function describeItem(node, mode) {
+    if (mode === "outline") {
+      const level = Number(node.getAttribute("aria-level") ?? node.localName.slice(1));
+      const headingLevel = Number.isInteger(level) && level >= 1 && level <= 6 ? level : 2;
+      return { label: `H${headingLevel}`, text: normalize(node.innerText ?? node.textContent), level: headingLevel };
+    }
     if (mode === "code") {
       const code = node.querySelector("code") ?? node;
       const language = Array.from(code.classList).find((name) => name.startsWith("language-"))?.slice(9);
@@ -236,6 +289,11 @@
     if (mode === "tables") {
       return { label: normalize(node.querySelector("caption")?.innerText) || "Table", text: normalize(node.innerText) };
     }
+    if (mode === "lists") {
+      const label = node.localName === "ol" ? "Numbered list" : "Bulleted list";
+      return { label, text: normalize(node.innerText) };
+    }
+    if (mode === "quotes") return { label: "Quote", text: normalize(node.innerText) };
     const tag = node.localName;
     const label = tag === "img" ? "Image" : tag === "iframe" ? "Embed" : "Chart";
     const caption = normalize(node.closest("figure")?.querySelector("figcaption")?.innerText);
@@ -245,38 +303,74 @@
     return { label, text };
   }
 
-  function collectItems(mode) {
-    if (mode === "conversation") return historyIndex ? conversationEntries() : Array.from(readMessages(messageSelector).values());
-
-    const messages = messageNodes(messageSelector);
+  function readItems(message, mode) {
     const { selector } = views[mode];
-    const items = new Map();
-    for (const message of messages.keys()) {
-      for (const node of message.querySelectorAll(selector)) {
-        const parentItem = node.parentElement.closest(selector);
-        if (!visible(node) || (parentItem && message.contains(parentItem))) continue;
-        if (node.localName === "img" && node.naturalWidth > 0 && node.naturalWidth < 40 && node.naturalHeight < 40) continue;
-        items.set(node, { key: node, node, ...describeItem(node, mode) });
+    const items = [];
+    const root = message.node;
+    const measure = Number.isFinite(message.top);
+    const origin = measure ? chatScroller.scrollTop - viewportTop(chatScroller) : 0;
+    for (const node of root.querySelectorAll(selector)) {
+      const parentItem = node.parentElement.closest(selector);
+      if (!visible(node) || node.closest(screenReaderOnly) || (parentItem && root.contains(parentItem))) continue;
+      if (node.localName === "img" && node.naturalWidth > 0 && node.naturalWidth < 40 && node.naturalHeight < 40) continue;
+      const description = describeItem(node, mode);
+      if (mode === "outline" && !description.text) continue;
+      const key = typeof message.key === "string" ? `${message.key}\u001f${mode}\u001f${items.length}` : node;
+      const rect = measure ? node.getBoundingClientRect() : undefined;
+      const top = rect?.height ? rect.top + origin : message.top;
+      items.push({ key, node, mode, messageKey: message.key, top, ...description });
+    }
+    return items;
+  }
+
+  function collectItems(mode) {
+    const messages = historyIndex ? conversationEntries() : Array.from(readMessages(messageSelector).values());
+    if (mode === "conversation") return messages;
+
+    const results = [];
+    let topic = "";
+    for (const message of messages) {
+      if (message.label === "You") topic = message.text;
+      const context = topic || message.text;
+      const shortContext = context.length > 75 ? `${context.slice(0, 72)}…` : context;
+      const group = { key: message.key, title: `${message.label} · ${shortContext}` };
+      const items = message.details ? message.details[mode] : readItems(message, mode);
+      const topLevel = mode === "outline" ? Math.min(...items.map(({ level }) => level)) : undefined;
+      for (const item of items) {
+        if (mode === "outline" && topLevelOnly.checked && item.level !== topLevel) continue;
+        results.push({ ...item, group, indent: item.level ? item.level - topLevel : 0 });
       }
     }
-    return Array.from(items.values());
+    return results;
   }
 
   function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  async function findIndexedMessage(entry, container, request) {
+  function targetNode(entry, messages) {
+    if (entry.node?.isConnected) return entry.node;
+    const message = messages.get(entry.messageKey ?? entry.key);
+    if (!message?.node.isConnected) return undefined;
+    if (entry.mode) {
+      const matches = readItems(message, entry.mode).filter(({ label, text }) => label === entry.label && text === entry.text);
+      const match = matches.find(({ key }) => key === entry.key);
+      return match?.node ?? (matches.length === 1 ? matches[0].node : undefined);
+    }
+    return message.node;
+  }
+
+  async function findIndexedTarget(entry, container, request) {
     const step = Math.max(1, container.clientHeight * 0.7);
     const top = entry.top - scrollAnchor(container) + viewportTop(container);
-    notice = "Finding message…";
+    notice = "Finding item…";
     renderList();
     for (const offset of [0, -step, step]) {
       container.scrollTo({ top: top + offset, behavior: "instant" });
       for (let attempt = 0; attempt < 4; attempt++) {
         await delay(80);
         if (request !== jumpRequest || pathname !== location.pathname || !container.isConnected) return;
-        const node = readMessages(messageSelector).get(entry.key)?.node;
+        const node = targetNode(entry, readMessages(messageSelector));
         if (!node) continue;
         notice = "";
         refreshPrompts();
@@ -284,14 +378,14 @@
         return;
       }
     }
-    notice = "Message unavailable. Try scanning again.";
+    notice = "Item unavailable. Try scanning again.";
     renderList();
   }
 
   function chooseResult(entry) {
     if (!entry || scan) return;
     const request = ++jumpRequest;
-    const node = mounted.get(entry.key)?.node ?? entry.node;
+    const node = targetNode(entry, mounted);
     if (node?.isConnected) {
       if (notice) {
         notice = "";
@@ -299,7 +393,7 @@
       }
       jumpTo(node, entry.key);
     } else if (chatScroller?.isConnected && Number.isFinite(entry.top)) {
-      void findIndexedMessage(entry, chatScroller, request);
+      void findIndexedTarget(entry, chatScroller, request);
     }
   }
 
@@ -310,6 +404,16 @@
     const position = index === -1 ? (direction === 1 ? 0 : keys.length - 1) :
       (index + direction + keys.length) % keys.length;
     chooseResult(targets.get(keys[position]));
+  }
+
+  function updateGroupControls() {
+    const groups = Array.from(list.querySelectorAll("details"));
+    const hasGroups = groups.length > 0;
+    depth.hidden = view.value !== "outline";
+    detailControls.hidden = !hasGroups && depth.hidden;
+    foldAll.hidden = !hasGroups;
+    const label = groups.some((group) => group.open) ? "Collapse all" : "Expand all";
+    if (foldAll.textContent !== label) foldAll.textContent = label;
   }
 
   function renderList() {
@@ -326,7 +430,10 @@
       const start = Math.max(0, offset - 48);
       const end = start + 150;
       const excerpt = `${start ? "…" : ""}${text.slice(start, end)}${text.length > end ? "…" : ""}`;
-      results.push({ key, entry, label: browsingPrompts ? String(index + 1) : label, excerpt, browsingPrompts });
+      results.push({
+        key, entry, label: browsingPrompts ? String(index + 1) : label, excerpt, browsingPrompts,
+        group: entry.group, indent: entry.indent,
+      });
     });
 
     const total = entries.length;
@@ -334,33 +441,64 @@
       `${total} ${noun}${total === 1 ? "" : "s"}`);
     if (status.textContent !== summary) status.textContent = summary;
     targets = new Map(results.map(({ key, entry }) => [key, entry]));
-    if (results.length === displayed.length && results.every(({ key, label, excerpt, browsingPrompts }, index) => (
+    if (results.length === displayed.length && results.every(({ key, label, excerpt, group, indent, browsingPrompts }, index) => (
       key === displayed[index].key && label === displayed[index].label && excerpt === displayed[index].excerpt &&
+      group?.title === displayed[index].group?.title && indent === displayed[index].indent &&
       browsingPrompts === displayed[index].browsingPrompts
     ))) {
+      updateGroupControls();
       updateNavigation();
       return;
     }
-    displayed = results.map(({ key, label, excerpt, browsingPrompts }) => ({ key, label, excerpt, browsingPrompts }));
+    displayed = results.map(({ entry, ...result }) => result);
     list.classList.toggle("details", !browsingPrompts);
+    list.classList.toggle("outline", view.value === "outline");
     const focusedRow = shadow.activeElement;
     const items = document.createDocumentFragment();
     let nextFocus;
     const visibleRows = new Map();
+    const groups = new Map();
+    const collapsed = collapsedGroups.get(view.value);
 
-    for (const { key, label, excerpt } of results) {
+    for (const { key, label, excerpt, group, indent } of results) {
       const button = element("button", "", { type: "button" });
+      if (indent) button.classList.add(`indent-${indent}`);
       button.append(element("span", label, { class: browsingPrompts ? "number" : "label" }));
       if (excerpt) button.append(element("span", excerpt));
       button.addEventListener("click", () => chooseResult(targets.get(key)));
       const item = element("li");
       item.append(button);
-      items.append(item);
+      let groupList = groups.get(group?.key);
+      if (group && !groupList) {
+        const disclosure = element("details", "", { class: "group" });
+        disclosure.open = Boolean(query) || !collapsed.has(group.key);
+        disclosure.addEventListener("toggle", () => {
+          if (!disclosure.isConnected) return;
+          if (!query) {
+            if (disclosure.open) collapsed.delete(group.key);
+            else collapsed.add(group.key);
+          }
+          if (!groupControlsFrame) {
+            groupControlsFrame = requestAnimationFrame(() => {
+              groupControlsFrame = 0;
+              updateGroupControls();
+            });
+          }
+        });
+        groupList = element("ul", "", { class: "group-items", role: "list" });
+        disclosure.append(element("summary", group.title), groupList);
+        const wrapper = element("li");
+        wrapper.append(disclosure);
+        items.append(wrapper);
+        groups.set(group.key, groupList);
+      }
+      (groupList ?? items).append(item);
       visibleRows.set(key, button);
       if (focusedRow && focusedRow === rows.get(key)) nextFocus = button;
     }
     rows = visibleRows;
     list.replaceChildren(items);
+    updateGroupControls();
     updateNavigation();
     nextFocus?.focus({ preventScroll: true });
   }
@@ -383,6 +521,8 @@
     scanButton.textContent = busy ? "Stop scan" : "Scan full chat";
     search.disabled = busy;
     view.disabled = busy;
+    topLevelOnly.disabled = busy;
+    foldAll.disabled = busy;
     list.inert = busy;
     updateNavigation();
   }
@@ -460,6 +600,8 @@
       historyIndex = undefined;
       chatScroller = undefined;
       mounted.clear();
+      detailSnapshots = new WeakMap();
+      for (const groups of collapsedGroups.values()) groups.clear();
       lastJump = undefined;
       selectedResult = undefined;
       jumpRequest++;
@@ -498,7 +640,9 @@
     if (host.contains(target)) return false;
     if (target?.closest(selector)) return true;
     if (record.type === "attributes") {
-      if (["hidden", "aria-hidden", "data-testid"].includes(record.attributeName)) return target?.querySelector(selector);
+      if (["hidden", "aria-hidden", "data-testid", "aria-level", "role", "alt", "title", "aria-label"].includes(record.attributeName)) {
+        return target?.querySelector(selector);
+      }
       return true;
     }
     const nodes = [...record.addedNodes, ...record.removedNodes];
@@ -509,17 +653,19 @@
 
   launcher.addEventListener("click", () => setOpen(panel.hidden));
   scanButton.addEventListener("click", () => void scanConversation());
-  previous.addEventListener("click", () => {
-    if (isPromptList()) chooseResult(prompts[indexAtViewport() - 1]);
-    else stepResult(-1);
+  previous.addEventListener("click", () => chooseResult(navigationTargets().before));
+  next.addEventListener("click", () => chooseResult(navigationTargets().after));
+  latest.addEventListener("click", () => chooseResult(Array.from(targets.values()).at(-1)));
+  foldAll.addEventListener("click", () => {
+    const groups = Array.from(list.querySelectorAll("details"));
+    const expand = groups.every((group) => !group.open);
+    for (const group of groups) group.open = expand;
+    updateGroupControls();
   });
-  next.addEventListener("click", () => {
-    if (isPromptList()) chooseResult(prompts[indexAtViewport() + 1]);
-    else stepResult(1);
-  });
-  latest.addEventListener("click", () => {
-    if (isPromptList()) chooseResult(prompts.at(-1));
-    else chooseResult(Array.from(targets.values()).at(-1));
+  topLevelOnly.addEventListener("change", () => {
+    jumpRequest++;
+    notice = "";
+    renderList();
   });
   search.addEventListener("input", () => {
     jumpRequest++;
@@ -573,7 +719,10 @@
   window.addEventListener("popstate", scheduleRefresh);
 
   const observer = new MutationObserver((records) => {
-    if (pathname !== location.pathname || records.some(touchesMessage)) scheduleRefresh();
+    if (pathname !== location.pathname || records.some(touchesMessage)) {
+      detailSnapshots = new WeakMap();
+      scheduleRefresh();
+    }
   });
   observer.observe(document.body, {
     subtree: true,
@@ -581,7 +730,7 @@
     characterData: true,
     attributes: true,
     attributeFilter: [...turnAttributes, "data-message-author-role", "data-user-message-bubble", "data-turn",
-      "data-conversation-role", "data-message-role", "data-testid", "hidden", "aria-hidden"],
+      "data-conversation-role", "data-message-role", "data-testid", "hidden", "aria-hidden", "aria-level", "role", "alt", "title", "aria-label"],
   });
   refreshPrompts();
 })();

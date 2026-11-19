@@ -1,0 +1,278 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Navigator tests running</title>
+<style>main { margin-top: 72px; height: 520px; overflow: auto; } article { min-height: 345px; }</style>
+<output id="report">Running navigator checks…</output>
+<main></main>
+<script>
+if (!new URLSearchParams(location.search).has("addon")) {
+  window.browser = { runtime: { getURL: (path) => new URL("../" + path, location.href).href } };
+  const script = document.createElement("script");
+  script.src = "../navigator.js";
+  document.head.append(script);
+}
+</script>
+<script>
+const host = () => document.querySelector("#chatgpt-conversation-navigator");
+const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+const wait = () => new Promise(resolve => setTimeout(resolve, 100));
+const assert = (test, message) => { if (!test) throw new Error(message); };
+(async () => {
+  for (let i = 0; i < 40 && (!host() || !host().shadowRoot.querySelector("link").sheet); i++) await wait();
+  assert(host()?.hidden, "content script injects and hides launcher on empty conversation");
+  const main = document.querySelector("main");
+  main.innerHTML = '<article data-turn="user"><div data-message-author-role="user">Plan a trip</div></article><article data-turn="assistant">Assistant answer with a train route<pre><code class="language-python">print(&quot;night train&quot;)</code></pre><table><caption>Transport fares</caption><tr><td>Night ticket</td></tr></table><figure><canvas aria-label="Passenger chart"></canvas><figcaption>Yearly passengers</figcaption></figure></article><article data-turn="user">Find a hotel</article><article data-content-search-unit-key="conv:3:user"><div data-user-message-bubble="true">Book a train</div></article>';
+  await frame();
+  const ui = host().shadowRoot;
+  const find = selector => ui.querySelector(selector);
+  const status = () => find("[role=status]").textContent;
+  const active = () => find("[aria-current=true]")?.textContent;
+  const key = (element, options) => element.dispatchEvent(new KeyboardEvent("keydown", { ...options, bubbles: true, composed: true, cancelable: true }));
+  const filter = value => {
+    find("input").value = value;
+    find("input").dispatchEvent(new Event("input"));
+  };
+  assert(getComputedStyle(host()).position === "fixed", "packaged stylesheet loads");
+  assert(!host().hidden, "launcher shows when prompts are added");
+  key(document, { code: "KeyJ", altKey: true, shiftKey: true });
+  assert(!find("section").hidden && status() === "3 prompts", "shortcut opens, deduplicates and excludes assistant");
+  assert(ui.activeElement === find("input"), "search receives focus");
+  filter("HoTeL");
+  assert(status() === "1 of 4 messages", "case-insensitive search");
+  key(find("input"), { key: "Enter" });
+  assert(active().includes("Find a hotel") && main.scrollTop > 500, "Enter scrolls conversation to result");
+  filter("train");
+  assert(status() === "2 of 4 messages" && find(".list").textContent.includes("ChatGPT"), "search includes replies and prompts");
+  key(find("input"), { key: "Enter" });
+  assert(active().includes("Assistant answer"), "first search result points to the reply");
+  key(find("input"), { key: "Enter" });
+  assert(active().includes("Book a train"), "Enter advances to the next result");
+  key(find("input"), { key: "Enter", shiftKey: true });
+  assert(active().includes("Assistant answer"), "Shift+Enter goes to the previous result");
+  const select = value => {
+    find("select").value = value;
+    find("select").dispatchEvent(new Event("change"));
+  };
+  select("code");
+  assert(status() === "1 code block" && find(".list").textContent.includes("python code"), "code block catalog shows language and contents");
+  find(".list button").click();
+  const jumpAligned = (selector) => {
+    const target = main.querySelector(selector);
+    return !!target && Math.abs(target.getBoundingClientRect().top - (main.getBoundingClientRect().top + 16)) < 2;
+  };
+  assert(active().includes("night train") && jumpAligned("pre"), "code jump scrolls to the block");
+  select("tables");
+  assert(status() === "1 table" && find(".list").textContent.includes("Transport fares"), "table catalog shows the caption");
+  filter("ticket");
+  assert(status() === "1 of 1 table", "table search includes cell text");
+  find(".list button").click();
+  assert(jumpAligned("table"), "table jump scrolls to the table");
+  select("visuals");
+  assert(status() === "1 visual" && find(".list").textContent.includes("Yearly passengers"), "chart catalog shows the figure caption");
+  find(".list button").click();
+  assert(jumpAligned("canvas"), "chart jump scrolls to the canvas");
+  filter("passenger chart");
+  assert(status() === "1 of 1 visual", "visual search includes accessible labels");
+  select("conversation");
+  find("[aria-label='Latest prompt']").click();
+  assert(active().includes("Book a train") && find("[aria-label='Next prompt']").disabled, "Latest selects last prompt");
+  find("[aria-label='Previous prompt']").click();
+  assert(active().includes("Find a hotel"), "Previous works at scroll limit");
+  find("[aria-label='Next prompt']").click();
+  assert(active().includes("Book a train"), "Next works");
+  main.scrollTop = 0;
+  await frame();
+  assert(active().includes("Plan a trip"), "manual scroll updates active prompt");
+  find(".list li:last-child button").click();
+  assert(active().includes("Book a train"), "selecting a prompt jumps to it");
+  key(find("input"), { key: "Escape" });
+  assert(find("section").hidden && ui.activeElement === find(".launcher"), "Escape closes and restores focus");
+  main.innerHTML = '<article data-turn="user">New conversation</article>';
+  await frame();
+  find(".launcher").click();
+  assert(status() === "1 prompt" && find(".list").textContent.includes("New conversation"), "list updates when conversation changes");
+  const waitUntil = async (condition, message) => {
+    for (let i = 0; i < 100; i++) {
+      if (condition()) return;
+      await wait();
+    }
+    throw new Error(message + " (" + status() + ")");
+  };
+  main.innerHTML = '<div data-conversation-role="assistant">Only a reply is mounted here</div>';
+  await frame();
+  assert(!host().hidden && status() === "0 prompts", "reply-only viewport keeps the scan control available");
+  main.innerHTML = '<article data-turn="user"><h5 class="sr-only">You said:</h5></article><article data-turn="user"><h5 class="sr-only">You said:</h5><div>How do I get to the station?</div></article><article data-conversation-role="user"><div><span class="visually-hidden" style="display:none">You said:</span><p>You said: leave at noon.</p></div></article><article data-turn="assistant"><h5 class="sr-only">ChatGPT said:</h5><div>The station is nearby.</div></article>';
+  await frame();
+  assert(status() === "2 prompts", "heading-only turns do not create a row");
+  assert(!find(".list li:first-child").textContent.includes("You said:"), "speaker heading omitted from prompt preview");
+  assert(find(".list li:last-child").textContent.includes("You said: leave at noon."), "literal prompt remains intact");
+  filter("you said:");
+  assert(status() === "1 of 3 messages", "search indexes user text and excludes headings");
+  filter("chatgpt said:");
+  assert(status() === "0 of 3 messages", "reply headings are excluded from search");
+  filter("");
+  main.innerHTML = `
+    <article data-turn="user" data-turn-id="navigate-1">First navigation prompt</article>
+    <article data-turn="assistant" data-turn-id="outline-1" style="min-height:1150px">
+      <h5 class="sr-only">ChatGPT said:</h5>
+      <h2 id="routes">Transit routes</h2>
+      <div style="height:220px"></div>
+      <h3 id="weekend">Weekend service</h3>
+      <ol id="itinerary"><li>Pack a bag</li><li>Leave early</li></ol>
+      <blockquote id="notice">Service changes on Sundays.</blockquote>
+      <div role="heading" aria-level="4">Holiday exceptions</div>
+    </article>
+    <article data-turn="user" data-turn-id="navigate-2">Second navigation prompt</article>
+    <article data-turn="assistant" data-turn-id="outline-2">
+      <h2>Hotels near the station</h2>
+    </article>
+    <article data-turn="user" data-turn-id="navigate-3">Third navigation prompt</article>
+    <article data-turn="assistant" data-turn-id="end" style="min-height:650px">Last reply</article>
+  `;
+  main.scrollTop = 0;
+  await frame();
+  select("outline");
+  const groups = () => Array.from(ui.querySelectorAll(".list details"));
+  assert(status() === "4 headings" && groups().length === 2, "semantic headings are grouped by reply");
+  assert(!find(".list").textContent.includes("ChatGPT said:"), "outline omits the page's screen-reader heading");
+  assert(find(".list").textContent.includes("H4Holiday exceptions"), "ARIA heading levels are read");
+  groups()[0].querySelector("summary").click();
+  await frame();
+  assert(!groups()[0].open && groups()[1].open, "one group can collapse independently");
+  const fold = find(".detail-controls button");
+  fold.click();
+  assert(groups().every(group => !group.open) && fold.textContent === "Expand all", "collapse all closes every group");
+  find("[aria-label='Next item']").click();
+  assert(groups()[0].open && jumpAligned("#routes"), "Next opens a collapsed group and aligns the heading");
+  find("[aria-label='Next item']").click();
+  assert(active().includes("Weekend service") && jumpAligned("#weekend"), "Next goes to the adjacent subheading");
+  find("[aria-label='Previous item']").click();
+  assert(active().includes("Transit routes") && find("[aria-label='Previous item']").disabled, "Previous lands on first heading and stops");
+  const topLevel = find("input[type=checkbox]");
+  topLevel.click();
+  assert(status() === "2 headings" && !find(".list").textContent.includes("Weekend"), "top-level toggle hides subheadings");
+  topLevel.click();
+  assert(status() === "4 headings", "subheading toggle restores hierarchy");
+  filter("weekend");
+  assert(status() === "1 of 4 headings" && groups().every(group => group.open), "heading search exposes matching collapsed groups");
+  select("lists");
+  assert(status() === "1 list" && find(".list").textContent.includes("Leave early"), "lists are indexed");
+  find(".list button").click();
+  assert(jumpAligned("#itinerary"), "list jump lands on the list");
+  select("quotes");
+  assert(status() === "1 quote" && find(".list").textContent.includes("Service changes"), "quotes are indexed");
+  find(".list button").click();
+  assert(jumpAligned("#notice"), "quote jump lands on the quote");
+  select("conversation");
+  const spacer = document.createElement("div");
+  spacer.style.height = "220px";
+  main.prepend(spacer);
+  main.scrollTop = 0;
+  await frame();
+  find("[aria-label='Next prompt']").click();
+  assert(jumpAligned('[data-turn-id="navigate-1"]'), "Next from before the first prompt lands on the first prompt");
+  spacer.remove();
+  main.scrollTop = 800;
+  await frame();
+  find("[aria-label='Previous prompt']").click();
+  assert(active().includes("First navigation prompt"), "Previous after manual scrolling goes to the nearest earlier prompt");
+  find("[aria-label='Next prompt']").click();
+  assert(active().includes("Second navigation prompt"), "Next advances one prompt after an explicit jump");
+  find("[aria-label='Previous prompt']").click();
+  assert(active().includes("First navigation prompt") && find("[aria-label='Previous prompt']").disabled, "Previous stops at the first prompt");
+  main.scrollTop = main.scrollHeight;
+  await frame();
+  assert(find("[aria-label='Next prompt']").disabled, "Next stops at the bottom");
+  find("[aria-label='Previous prompt']").click();
+  assert(active().includes("Third navigation prompt"), "Previous from the bottom goes to the closest prompt");
+
+  const rowHeight = 270;
+  let count = 40;
+  let firstId = 4;
+  let requested = false;
+  let currentRange = "";
+  const stage = document.createElement("div");
+  stage.style.position = "relative";
+  main.replaceChildren(stage);
+  function virtualize() {
+    if (main.scrollTop <= 1 && !requested) {
+      requested = true;
+      setTimeout(() => {
+        firstId = 0;
+        count = 44;
+        currentRange = "";
+        virtualize();
+      }, 220);
+    }
+    stage.style.height = (count * rowHeight) + "px";
+    const start = Math.max(0, Math.floor(main.scrollTop / rowHeight) - 1);
+    const end = Math.min(count, Math.ceil((main.scrollTop + main.clientHeight) / rowHeight) + 1);
+    const range = start + ":" + end;
+    if (range === currentRange) return;
+    currentRange = range;
+    const entries = [];
+    for (let i = start; i < end; i++) {
+      const id = firstId + i;
+      const entry = document.createElement("div");
+      const role = id % 2 === 0 ? "user" : "assistant";
+      entry.dataset.conversationRole = role;
+      entry.dataset.turnKey = "virtual-turn-" + id;
+      entry.style.cssText = "position:absolute;top:" + (rowHeight * i) + "px;height:32px";
+      if (id === 0) entry.innerHTML = '<h5 class="sr-only">You said:</h5><span>Earliest question about the alpine pass</span>';
+      else if (id === 1) entry.innerHTML = '<p>Earliest response with train times</p><h2 id="historical-heading">Early timetable</h2><pre id="historical-code"><code>historic_code()</code></pre>';
+      else if (id === 2 || id === 6) entry.textContent = "Repeated prompt with distinct turns";
+      else entry.textContent = (role === "user" ? "Prompt " : "Reply ") + id;
+      entries.push(entry);
+    }
+    stage.replaceChildren(...entries);
+  }
+  stage.style.height = (count * rowHeight) + "px";
+  main.scrollTop = main.scrollHeight;
+  main.addEventListener("scroll", virtualize);
+  virtualize();
+  await frame();
+  const scan = Array.from(ui.querySelectorAll("button")).find(button => button.textContent === "Scan full chat");
+  assert(scan && find(".list").children.length < 10, "virtualized chat starts with a partial list");
+  const distanceFromBottom = main.scrollHeight - main.clientHeight - main.scrollTop;
+  scan.click();
+  await waitUntil(() => scan.textContent === "Scan full chat" && find(".list").children.length === 22, "scan finds all virtualized prompts including prepended history");
+  assert(main.scrollHeight - main.clientHeight - main.scrollTop === distanceFromBottom, "scan restores the starting position after prepending");
+  assert(find(".list li:first-child").textContent.includes("Earliest question"), "scan keeps chronological order");
+  assert(!find(".list li:first-child").textContent.includes("You said:"), "scan excludes speaker headings");
+  assert(Array.from(find(".list").children).filter(row => row.textContent.includes("Repeated prompt")).length === 2, "repeated prompt text does not collapse different turns");
+  assert(!main.querySelector('[data-turn-key="virtual-turn-0"]'), "first prompt is currently unmounted");
+  find(".list li:first-child button").click();
+  await waitUntil(() => !!active()?.includes("Earliest question"), "jump to an unmounted prompt");
+  assert(main.scrollTop < 2 && main.querySelector('[data-turn-key="virtual-turn-0"]'), "old message remounts at the top");
+  filter("earliest response");
+  assert(status() === "1 of 44 messages" && find(".list").textContent.includes("ChatGPT"), "search covers scanned replies");
+  filter("");
+  find("[aria-label='Latest prompt']").click();
+  await waitUntil(() => !!active()?.includes("Prompt 42"), "jump back to the latest indexed prompt");
+  assert(!main.querySelector("#historical-heading"), "historic heading is unmounted at the bottom");
+  select("outline");
+  filter("early timetable");
+  assert(status() === "1 of 1 heading", "full scan indexes headings in unmounted replies");
+  find(".list button").click();
+  await waitUntil(() => !!active()?.includes("Early timetable") && jumpAligned("#historical-heading"), "jump rehydrates the exact heading");
+  select("conversation");
+  find("[aria-label='Latest prompt']").click();
+  await waitUntil(() => !main.querySelector("#historical-code"), "history unmounts after jumping to the latest prompt");
+  select("code");
+  filter("historic_code");
+  assert(status() === "1 of 1 code block", "full scan indexes code in unmounted replies");
+  find(".list button").click();
+  await waitUntil(() => !!active()?.includes("historic_code") && jumpAligned("#historical-code"), "jump rehydrates the exact code block");
+  select("conversation");
+  scan.click();
+  scan.click();
+  await waitUntil(() => scan.textContent === "Scan full chat", "stop scan restores normal controls");
+  assert(find(".list").children.length === 22, "cancelled rescan retains the existing index");
+  document.title = "PASS: prompt navigation, outline and groups, all detail views, speaker labels, and virtualized jumps";
+  document.querySelector("#report").textContent = document.title;
+})().catch(error => {
+  document.title = "FAIL: " + error.message;
+  document.querySelector("#report").textContent = document.title;
+  console.error(error);
+});
+</script>

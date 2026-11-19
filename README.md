@@ -20,8 +20,12 @@ Firefox removes temporary add-ons when it restarts. Repeat steps 1–3 to load i
 
 - Click **Navigate chat** near the upper right or press **Alt+Shift+J** to open the navigator.
 - In **Conversation**, browse your prompts or type to search both prompts and replies.
-- If older prompts are missing, click **Scan full chat**. The navigator scrolls through the conversation, indexes the prompts and replies as they appear, and returns to your starting position. **Stop scan** ends the scan early.
-- Choose **Code blocks**, **Tables**, or **Charts & images** to list those items. You can search the selected list by its text or available captions and labels.
-- Click a result to jump to it. In the search box, press **Enter** or **Shift+Enter** to cycle forward or backward. Press **Esc** to close the panel.
+- If older items are missing, click **Scan full chat**. The navigator scrolls through the conversation, indexes what ChatGPT loads, and returns to your starting position. **Stop scan** ends the scan early.
+- Choose **Outline** to jump to headings or **Top-level only** to hide subheadings. You can also browse **Code blocks**, **Tables**, **Charts & images**, **Lists**, or **Quotes**. These views group items by message and let you expand or collapse each group or all groups together.
+- Click an item to jump to it. **Previous** and **Next** move within the selected view, using where you are in the conversation or the last item you jumped to. In the search box, **Enter** or **Shift+Enter** cycles through results. **Esc** closes the panel.
 
-The conversation index is kept in memory for the current tab and clears when you switch chats or reload. The code, table, and visual lists show items currently loaded by ChatGPT.
+The index is kept in memory for the current tab and clears when you switch chats or reload. It covers the content ChatGPT makes available as you scroll.
+
+## Tests
+
+Open [tests/navigator.html](tests/navigator.html) directly in Firefox. It reports **PASS** or the first failing check and uses synthetic conversation data. It tests actual scroll positions, Previous and Next, outline controls, searchable content, and jumps to items that have been scrolled out of the page.
